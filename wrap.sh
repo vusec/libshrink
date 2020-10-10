@@ -1,5 +1,7 @@
 #!/bin/bash
 
+set -e
+
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 [  $# -lt 1 ] && { echo "Usage: $0 binary [args]"; exit 1; }
@@ -11,9 +13,9 @@ if [ ! -f $prog ]; then
 fi
 
 prelink_dir="prelink-`echo $prog | tr / _`"
-"$DIR/prelink_binary.py" --set-rpath "$prog" --preload-lib "$DIR/libpreload.so"
+"$DIR/prelink_binary.py" --set-rpath "$prog" --preload-lib "$DIR/obj/libshrink-preload.so"
 
 newprog="$prelink_dir/`basename "$prog"`"
 export LD_LIBRARY_PATH="`pwd`/$prelink_dir:$LD_LIRARY_PATH"
-export LD_PRELOAD="`pwd`/$prelink_dir/libpreload.so"
+export LD_PRELOAD="`pwd`/$prelink_dir/libshrink-preload.so"
 exec "$newprog" "$@"
