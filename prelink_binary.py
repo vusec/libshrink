@@ -50,14 +50,16 @@ def get_overlap(mapping, other_mappings):
 
 
 def get_binary_info(prog):
-    """Look for the loader requested by the program, and record existing
-    mappings required by program itself."""
+    """Look for the loader requested by the program, ELF type, and record
+    existing mappings required by program itself."""
 
     interp = None
     binary_mappings = []
+    elftype = None
 
     with open(prog, 'rb') as f:
         e = ELFFile(f)
+        elftype = e.header['e_type']
         for seg in e.iter_segments():
             if isinstance(seg, InterpSegment):
                 interp = seg.get_interp_name()
@@ -66,7 +68,7 @@ def get_binary_info(prog):
     if interp is None:
         raise Exception("Could not find interp in binary")
 
-    return interp, binary_mappings
+    return interp, elftype, binary_mappings
 
 
 def get_library_deps(library, library_path):
@@ -95,7 +97,9 @@ def prelink_libs(libs, outdir, existing_mappings, baseaddr=0xf0ffffff):
 
     for lib in libs:
         newlib = os.path.join(outdir, os.path.basename(lib))
-        shutil.copy(lib, newlib)
+
+        if lib != newlib:
+            shutil.copy(lib, newlib)
 
         reallib = os.path.realpath(lib)
         for debuglib in (reallib + ".debug", "/usr/lib/debug" + reallib):
@@ -117,6 +121,9 @@ def prelink_libs(libs, outdir, existing_mappings, baseaddr=0xf0ffffff):
                 if seg['p_align'] > align:
                     align = seg['p_align']
                 size = seg['p_vaddr'] + seg['p_memsz']
+
+            # Add some breathing room, otherwise mmap might think it won't fit.
+            size += 4096
 
             baseaddr -= size
 
@@ -144,6 +151,17 @@ def baseaddr_from_bits(bits):
     assert bits > 8
     reserve_for_stack = (1 << (bits - 4)) - (1 << (bits - 8))
     return (1 << bits) - 1 - reserve_for_stack
+
+
+def make_binary_EXEC(path):
+    """Force the type of a binary to ET_EXEC (instead of for instance ET_DYN).
+    This is horrible."""
+
+    with open(path, 'rb') as f:
+        conts = f.read()
+    conts = conts[:0x10] + '\x02' + conts[0x11:]  # e_type = ET_EXEC
+    with open(path, 'wb') as f:
+        f.write(conts)
 
 
 def main():
@@ -182,27 +200,40 @@ def main():
         shutil.rmtree(outdir)
     os.mkdir(outdir)
 
-    # Get loader and existing mappings for binary
-    interp, binary_mappings = get_binary_info(args.binary)
-
-    # Determine all dependency libraries
-    libs = set()
-    libs.add(interp)
-    libs.update(get_library_deps(args.binary, args.library_path))
-    if not args.static_lib:
-        libs.update(get_library_deps(args.preload_lib, args.library_path))
-        libs.add(args.preload_lib)
-
-    # The magic, construct new addr space by prelinking all dependency libs
-    baseaddr = baseaddr_from_bits(args.addrspace_bits)
-    prelink_libs(libs, outdir, binary_mappings, baseaddr)
-
-    # Update the loader to use our prelinked version
     if args.in_place:
         newprog = args.binary
     else:
         newprog = os.path.join(outdir, os.path.basename(args.binary))
         shutil.copy(args.binary, newprog)
+
+    # Get loader and existing mappings for binary
+    interp, elftype, binary_mappings = get_binary_info(args.binary)
+
+    # Determine all dependency libraries
+    libs = set()
+    libs.add(interp)
+    libs.update(get_library_deps(args.binary, args.library_path))
+    # If using preload library, add that too
+    if not args.static_lib:
+        libs.update(get_library_deps(args.preload_lib, args.library_path))
+        libs.add(args.preload_lib)
+    # For PIE the binary is a library too
+    if elftype == 'ET_DYN':
+        libs.add(newprog)
+
+    # The magic: construct new addr space by prelinking all dependency libs.
+    # We need to do this first, as patchelf (later) may change the order of
+    # segments, causing prelink to bail out.
+    baseaddr = baseaddr_from_bits(args.addrspace_bits)
+    prelink_libs(libs, outdir, binary_mappings, baseaddr)
+
+    # The loader ignores addresses (set by prelink) for programs that are ET_DYN
+    # (i.e., PIE binaries), so we need to make it ET_EXEC instead.
+    # We need to do this *before* patchelf, otherwise it may break the binary.
+    if elftype == 'ET_DYN':
+        make_binary_EXEC(newprog)
+
+    # Update the loader to use our prelinked version
     newinterp = os.path.realpath(os.path.join(outdir, os.path.basename(interp)))
     ex("patchelf --set-interpreter \"%s\" \"%s\"" % (newinterp, newprog))
 
@@ -210,9 +241,11 @@ def main():
     if args.set_rpath:
         absoutdir = os.path.realpath(outdir)
         ex("patchelf --set-rpath \"%s\" \"%s\"" % (absoutdir, newprog))
+
         if not args.static_lib:
             newpreload = os.path.join(outdir, os.path.basename(args.preload_lib))
             ex("patchelf --set-rpath \"%s\" \"%s\"" % (absoutdir, newpreload))
+
 
 if __name__ == '__main__':
     main()
